@@ -1,0 +1,256 @@
+---
+title: "Sample_size"
+author: "Luis Segura"
+date: "2026-01-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(pROC)
+library(tidyverse)
+```
+
+
+## Objetivo:
+
+Supuestos: 
+- Hay 4 estratos mutuamente exclusivos (S1–S4). S1= ojo sano; S2= catarata con vision >20/200; S3 catarata con vision <20/200; S4= patologias oculares confusores de la calidad de la imagen.
+ 
+- Verdad = cualquier catarata (S2 or S3)
+
+- Output del algoritmo como un score probabilistico: p_hat = P(cataract) [0,1]
+
+- Queremos simular bases de datos con estos supuestos, estimar ROC/AUC, y obtener el power/ tamano de muestra
+
+### 1 Simulacion de una base de datos
+
+Usamos una distribucion beta para cada estrato (S1, ..., S4). Modelamos la probabilidad de prediccion del algoritmo `p_hat` con `Beta(alpha, beta)` porque esta limitada a 0, 1 y es flexible a sesgo o simetria.
+
+Para definir los parametros de la distribucion beta `alpha` y `beta`, usamos media `m` y precision `k`, con las cuales definimos varios escenarios. Donde `k` = 1/se
+
+Escogemos parametros que reflejen un comportamiento plausible del algoritmo:
+- S1 (ojo sano): p_hat cercano a 0 (baja probabilidad de clasificar como cataract)
+- S4 (patologias oculares, no catarata): tambien cercano a 0, pero con sesgo a la izquierda. (negativos dificiles de clasificar -> mas falsos positivos). pr = 10.8, se = 1.5
+- S2 (catarata, vision >20/200): p_hat moderado (cataratas dificiles de clasificar), pr = 4.2, se = 0.6
+- S3 (catarata, vision <20/200): p_hat alto (cataratas faciles de clasificar), pr = 3.7, 0.4
+
+```{r}
+# Esta función simula el comportamiento del algoritmo generando, para cada imagen y para cada estrato clínico, una probabilidad predicha de catarata. Dado el estrato, se asigna primero la verdad (catarata vs no catarata) y luego se simula el puntaje probabilístico del algoritmo mediante distribuciones Beta específicas por estrato. De esta forma, las diferencias entre estratos reflejan supuestos plausibles sobre cómo el algoritmo asigna probabilidades más bajas o más altas según la presencia y severidad de la catarata, introduciendo solapamiento y variabilidad realistas en los puntajes.
+
+simulate_validation_set <- function(
+    n1, n2, n3, n4,
+    beta_s1 = c(2, 18),
+    beta_s4 = c(2,  8),
+    beta_s2 = c(6,  6),
+    beta_s3 = c(12, 3)
+) {
+  # Construcción del conjunto de validación:
+  # Para cada estrato, se asigna la verdad clínica (y) de forma
+  # determinística según el estrato (S1/S4 -> y=0, S2/S3 -> y=1),
+  # y se simula únicamente el puntaje probabilístico del algoritmo.
+  bind_rows(
+    tibble(stratum = "S1", y = 0L, p_hat = rbeta(n1, beta_s1[1], beta_s1[2])),
+    tibble(stratum = "S4", y = 0L, p_hat = rbeta(n4, beta_s4[1], beta_s4[2])),
+    tibble(stratum = "S2", y = 1L, p_hat = rbeta(n2, beta_s2[1], beta_s2[2])),
+    tibble(stratum = "S3", y = 1L, p_hat = rbeta(n3, beta_s3[1], beta_s3[2]))
+  )
+}
+
+
+# Funcion para evaluar si el lower bound CI del AUC is menor a auc_min
+auc_test_once <- function(dat, alpha = 0.05, auc_min = 0.8) {
+  roc_obj <- pROC::roc(response = dat$y, predictor = dat$p_hat, quiet = TRUE)
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  
+  ci_level <- 1 - 2 * alpha
+  ci <- as.numeric(pROC::ci.auc(roc_obj, conf.level = ci_level, method = "delong"))
+  
+  # One-sided test via CI rule
+  # H0: AUC <= auc_min
+  # Use (1 - 2*alpha) two-sided CI
+  
+  list(
+    auc = auc_val,
+    ci_low = ci[1],
+    ci_high = ci[3],
+    reject = (ci[1] > auc_min)
+  )
+}
+
+# Esta función implementa la regla de decisión que convierte las probabilidades continuas del algoritmo en clasificaciones binarias mediante un punto de corte preespecificado (threshold), a partir del cual se derivan la sensibilidad y la especificidad. Es importante destacar que el umbral refleja una decisión clínica u operativa, y no una propiedad intrínseca del algoritmo, y que no afecta la capacidad discriminativa subyacente resumida por el área bajo la curva (AUC).
+se_sp_at_threshold <- function(dat, threshold = 0.5) {
+  yhat <- as.integer(dat$p_hat >= threshold)
+  
+  TP <- sum(yhat == 1 & dat$y == 1)
+  FN <- sum(yhat == 0 & dat$y == 1)
+  FP <- sum(yhat == 1 & dat$y == 0)
+  TN <- sum(yhat == 0 & dat$y == 0)
+  
+  Se <- ifelse((TP + FN) > 0, TP / (TP + FN), NA_real_)
+  Sp <- ifelse((TN + FP) > 0, TN / (TN + FP), NA_real_)
+  
+  c(Se = Se, Sp = Sp)
+}
+
+
+# Simulation-based power across sample-size grid
+power_curve_auc <- function(
+    n3_grid,
+    n2_over_n3 = 2,
+    n4_multiplier = 1,
+    n1_over_n4 = 2,
+    reps = 2000,
+    alpha = 0.05,
+    beta_params = list(
+      beta_s1 = c(2,18),
+      beta_s4 = c(2, 8),
+      beta_s2 = c(6, 6),
+      beta_s3 = c(12,3)
+    ),
+    eval_threshold = 0.5,
+    seed = 1
+) {
+  set.seed(seed)
+  
+  # Se fija por diseño el número de observaciones en cada estrato clínico
+  # (S1, S2, S3, S4), lo que determina cuántos casos verdaderos (y = 1)
+  # y controles verdaderos (y = 0) habrá en cada simulación.
+  # La verdad clínica NO se simula probabilísticamente aquí.
+  
+  map_dfr(n3_grid, function(n3) {
+    n2 <- n2_over_n3 * n3
+    n4 <- ceiling(n4_multiplier * n3)
+    n1 <- as.integer(n1_over_n4 * n4)
+    
+    one_sim <- function() {
+      tryCatch({
+        dat <- simulate_validation_set(
+          n1 = n1, n2 = n2, n3 = n3, n4 = n4,
+          beta_s1 = beta_params$beta_s1,
+          beta_s4 = beta_params$beta_s4,
+          beta_s2 = beta_params$beta_s2,
+          beta_s3 = beta_params$beta_s3
+        )
+        
+        a <- auc_test_once(dat, alpha = alpha)
+        ss <- se_sp_at_threshold(dat, threshold = eval_threshold)
+        
+        c(
+          auc = a$auc,
+          reject = as.numeric(a$reject),
+          ci_low = a$ci_low,
+          ci_high = a$ci_high,
+          Se = as.numeric(ss["Se"]),
+          Sp = as.numeric(ss["Sp"])
+        )
+      }, error = function(e) {
+        c(auc = NA_real_, reject = NA_real_, ci_low = NA_real_, ci_high = NA_real_,
+          Se = NA_real_, Sp = NA_real_)
+      })
+    }
+    
+    sims_list <- replicate(reps, one_sim(), simplify = FALSE)
+    sims_mat <- do.call(cbind, sims_list)
+    rownames(sims_mat) <- names(sims_list[[1]])
+    
+    tibble(
+      n1 = n1, n2 = n2, n3 = n3, n4 = n4,
+      N_total = n1 + n2 + n3 + n4,
+      mean_auc = mean(sims_mat["auc", ], na.rm = TRUE),
+      power_auc_gt_min_auc = mean(sims_mat["reject", ], na.rm = TRUE),
+      mean_ci_width = mean(sims_mat["ci_high", ] - sims_mat["ci_low", ], na.rm = TRUE),
+      mean_Se_at_thresh = mean(sims_mat["Se", ], na.rm = TRUE),
+      mean_Sp_at_thresh = mean(sims_mat["Sp", ], na.rm = TRUE),
+      fail_rate = mean(is.na(sims_mat["auc", ]))
+    )
+  })
+}
+
+# Helper para definir los parametros de Beta(alpha,beta) usando la media m and precision k
+beta_from_mean_k <- function(m, k) c(alpha = m * k, beta = (1 - m) * k)
+
+# --- Scenario A: Optimista (still good, but less perfect than before) ---
+beta_params_opt <- list(
+  beta_s1 = beta_from_mean_k(m = 0.12, k = 18),  # mean ~0.12, fairly tight
+  beta_s4 = beta_from_mean_k(m = 0.28, k = 10),  # mean ~0.25, more spread
+  beta_s2 = beta_from_mean_k(m = 0.48, k = 8),  # mean ~0.55, spread
+  beta_s3 = beta_from_mean_k(m = 0.65, k = 12)   # mean ~0.78, fairly tight
+)
+
+# --- Scenario B: Realistic (noticeable overlap; power won't saturate immediately) ---
+beta_params_real <- list(
+  beta_s1 = beta_from_mean_k(m = 0.15, k = 16),
+  beta_s4 = beta_from_mean_k(m = 0.33, k = 10),
+  beta_s2 = beta_from_mean_k(m = 0.52, k = 10),
+  beta_s3 = beta_from_mean_k(m = 0.70, k = 12)
+)
+
+# --- Scenario C: Pessimistic (lots of overlap; hardest case)
+beta_params_pess <- list(
+  beta_s1 = beta_from_mean_k(m = 0.18, k = 12),
+  beta_s4 = beta_from_mean_k(m = 0.40, k = 8),
+  beta_s2 = beta_from_mean_k(m = 0.50, k = 8),
+  beta_s3 = beta_from_mean_k(m = 0.62, k = 10)
+)
+
+# Scenario D: low algorithm AUC, beta means closer to each other.
+beta_params_lower_auc <- list(
+  beta_s1 = beta_from_mean_k(0.18, 14),
+  beta_s4 = beta_from_mean_k(0.38, 10),
+  beta_s2 = beta_from_mean_k(0.50, 10),
+  beta_s3 = beta_from_mean_k(0.60, 12)
+)
+
+# Scenario E. low AUC, increase noise (k)
+beta_params_noisy <- list(
+  beta_s1 = beta_from_mean_k(0.15, 8),
+  beta_s4 = beta_from_mean_k(0.33, 6),
+  beta_s2 = beta_from_mean_k(0.52, 6),
+  beta_s3 = beta_from_mean_k(0.70, 8)
+)
+
+# Run
+grid_n3 <- seq(5, 300, by = 25)
+
+pow_opt  <- power_curve_auc(n3_grid = grid_n3, reps = 1000, eval_threshold = 0.65,
+                            beta_params = beta_params_opt, seed = 1)
+
+pow_real <- power_curve_auc(n3_grid = grid_n3, reps = 1000, eval_threshold = 0.65,
+                            beta_params = beta_params_real, seed = 1)
+
+pow_pess <- power_curve_auc(n3_grid = grid_n3, reps = 1000, eval_threshold = 0.65,
+                            beta_params = beta_params_pess, seed = 1)
+
+pow_lower_auc <- power_curve_auc(n3_grid = grid_n3, reps = 1000, eval_threshold = 0.65,
+                            beta_params = beta_params_lower_auc, seed = 1)
+
+pow_noisy <- power_curve_auc(n3_grid = grid_n3, reps = 1000, eval_threshold = 0.65,
+                                 beta_params = beta_params_noisy, seed = 1)
+
+pow_all <- bind_rows(
+  pow_opt  |> mutate(scenario = "Optimistic"),
+  pow_real |> mutate(scenario = "Realistic"),
+  pow_pess |> mutate(scenario = "Pessimistic"), 
+  pow_lower_auc |> mutate(scenario = "Lower AUC"), 
+  pow_noisy |> mutate(scenario = "Noisy")
+)
+
+pow_all <- pow_all |>
+  mutate(scenario = factor(scenario))
+
+pow_all |>
+  ggplot(aes(x = N_total, y = mean_ci_width, 
+             group = scenario, colour = scenario)) + 
+  geom_line(size = 1) + 
+  geom_point(size = 2.5) +
+  labs(x = "Total images (N)", 
+       y = "Power: CI lower bound > 0.8",
+       title = "AUC CI width vs sample size under overlapping-score scenarios") +
+  ggthemes::theme_clean() +
+  scale_x_continuous(breaks = seq(0, 2000, by = 100)) +
+  scale_y_continuous(breaks = seq(0, 0.7, by = 0.005))
+
+```
+
